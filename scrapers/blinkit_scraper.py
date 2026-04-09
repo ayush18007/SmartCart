@@ -1,5 +1,74 @@
 from playwright.sync_api import sync_playwright
+from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
+from datetime import datetime, timedelta
+import os
 import time
+
+load_dotenv(dotenv_path='../backend/.env')
+DATABASE_URL = os.getenv("DATABASE_URL")
+engine = create_engine(DATABASE_URL)
+
+def check_cache(product_name, pincode):
+    """Check if we have fresh data for this product+pincode"""
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT ph.price, ph.quantity, ph.scraped_at 
+            FROM price_history ph
+            JOIN products p ON ph.product_id = p.id
+            WHERE p.name ILIKE :name 
+            AND ph.pincode = :pincode
+            AND ph.platform_id = 1
+            AND ph.expires_at > NOW()
+            LIMIT 1
+        """), {"name": f"%{product_name}%", "pincode": pincode})
+        return result.fetchone()
+
+def save_to_database(results, pincode):
+    """Save scraped results to database"""
+    with engine.connect() as conn:
+        for item in results:
+            try:
+                # Insert or get product
+                conn.execute(text("""
+                    INSERT INTO products (name, category)
+                    VALUES (:name, 'grocery')
+                    ON CONFLICT DO NOTHING
+                """), {"name": item["name"]})
+
+                product = conn.execute(text("""
+                    SELECT id FROM products WHERE name = :name
+                """), {"name": item["name"]}).fetchone()
+
+                if product:
+                    # Clean price - remove ₹ symbol
+                    price_str = item["price"].replace("₹", "").replace(",", "").strip()
+                    try:
+                        price = float(price_str)
+                    except:
+                        price = 0.0
+
+                    # Save price with 30 min expiry
+                    expires_at = datetime.now() + timedelta(minutes=30)
+                    
+                    conn.execute(text("""
+                        INSERT INTO price_history 
+                        (product_id, platform_id, price, quantity, pincode, expires_at)
+                        VALUES (:product_id, 1, :price, :quantity, :pincode, :expires_at)
+                    """), {
+                        "product_id": product[0],
+                        "price": price,
+                        "quantity": item["quantity"],
+                        "pincode": pincode,
+                        "expires_at": expires_at
+                    })
+                    print(f"💾 Saved: {item['name']} | ₹{price}")
+
+            except Exception as e:
+                print(f"DB error for {item['name']}: {e}")
+
+        conn.commit()
+        print("✅ All results saved to database!")
 
 def scrape_blinkit(product_name, pincode):
     results = []
@@ -52,7 +121,6 @@ def scrape_blinkit(product_name, pincode):
                     price = price_elements[i].inner_text().strip() if i < len(price_elements) else "N/A"
                     quantity = quantity_elements[i].inner_text().strip() if i < len(quantity_elements) else "N/A"
 
-                    # Skip if name is empty or it's a header
                     if not name or "Showing" in name:
                         continue
 
@@ -72,16 +140,15 @@ def scrape_blinkit(product_name, pincode):
         except Exception as e:
             print(f"Extraction error: {e}")
 
-        page.screenshot(path="blinkit_results.png")
-        print("📸 Screenshot saved!")
-        input("Press Enter to close browser...")
         browser.close()
+
+    # Save to database
+    if results:
+        save_to_database(results, pincode)
 
     return results
 
 if __name__ == "__main__":
     pincode = input("Enter your pincode: ")
     results = scrape_blinkit("amul butter", pincode)
-    print(f"\n✅ Total results: {len(results)}")
-    for r in results:
-        print(r)
+    print(f"\n✅ Total results scraped and saved: {len(results)}")
